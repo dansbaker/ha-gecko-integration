@@ -14,6 +14,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -162,3 +163,15 @@ class GeckoClimate(GeckoEntityAvailabilityMixin, CoordinatorEntity[GeckoVesselCo
             _LOGGER.error(
                 "Error setting temperature for %s: %s", self.entity_id, err
             )
+    
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Set new target hvac mode."""
+        if hvac_mode != HVACMode.HEAT:
+            raise ServiceValidationError(
+                f"Unsupported HVAC mode: {hvac_mode}. Only HEAT mode is supported.",
+                translation_domain=DOMAIN,
+                translation_key="unsupported_hvac_mode",
+            )
+        
+        # HEAT mode is the only supported mode and is always active
+        _LOGGER.debug("HVAC mode set to HEAT for %s (no action required)", self.entity_id)
