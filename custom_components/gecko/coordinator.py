@@ -121,27 +121,18 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._zones
 
     async def _simple_reconnect(self) -> None:
-        """Simple reconnection with fresh token."""
+        """Simple reconnection - let geckoIotClient handle token refresh."""
         try:
-            # Get config entry and API client
-            entry = self.hass.config_entries.async_get_entry(self.entry_id)
-            if not entry or not entry.runtime_data:
-                return
-            
-            api_client = entry.runtime_data.api_client
             connection_manager = await async_get_connection_manager(self.hass)
             
-            # Disconnect old connection
-            await connection_manager.async_disconnect_monitor(self.monitor_id)
-            await asyncio.sleep(RECONNECT_DELAY)
+            # Reconnect - the geckoIotClient will automatically call the token
+            # refresh callback to get a fresh URL with new tokens
+            success = await connection_manager.async_reconnect_monitor(self.monitor_id)
             
-            # Get fresh token and reconnect
-            livestream_data = await api_client.async_get_monitor_livestream(self.monitor_id)
-            new_url = livestream_data.get("brokerUrl")
-            
-            if new_url:
-                await self.async_setup_monitor_connection(new_url)
+            if success:
                 _LOGGER.info("Reconnected %s", self.vessel_name)
+            else:
+                _LOGGER.error("Failed to reconnect %s", self.vessel_name)
                 
         except Exception as e:
             _LOGGER.error("Failed to reconnect %s: %s", self.vessel_name, e)
