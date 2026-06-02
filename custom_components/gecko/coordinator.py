@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from datetime import timedelta
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List
 
+from aiohttp import ClientResponseError
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -24,6 +28,36 @@ UPDATE_INTERVAL_SECONDS = 30  # seconds between coordinator updates
 MAX_CONSECUTIVE_FAILURES = 2  # max failures before attempting reconnect
 RECONNECT_DELAY = 1  # seconds to wait before reconnecting
 INITIAL_ZONE_TIMEOUT = 60.0  # seconds to wait for initial zone data
+
+# Token-refresh throttling. The Gecko token endpoint
+# (/v1/monitors/{id}/iot/thirdPartySession) is rate limited; without these
+# guards a single MQTT timeout fans out into many concurrent refresh calls and
+# trips a 429, which then loops forever.
+MIN_TOKEN_REFRESH_INTERVAL = 30.0  # coalesce refreshes requested within this window
+DEFAULT_RATE_LIMIT_BACKOFF = 60.0  # backoff when a 429 carries no Retry-After
+MAX_RATE_LIMIT_BACKOFF = 600.0  # cap on any single backoff window
+
+
+def _parse_retry_after(headers: Any) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) into seconds."""
+    if not headers:
+        return None
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return float(int(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
 
 
 class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -67,6 +101,14 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Simple connection tracking
         self._consecutive_failures = 0
 
+        # Token-refresh throttling state. The refresh callback runs in
+        # gecko_iot_client worker threads, so this is guarded by a threading
+        # lock (not an asyncio lock) for single-flight behaviour.
+        self._token_refresh_lock = threading.Lock()
+        self._cached_ws_url: str | None = None
+        self._last_successful_refresh = 0.0
+        self._token_backoff_until = 0.0  # time.monotonic() until which to back off
+
     def register_zone_update_callback(self, callback):
         """Register a callback to be called when zone data updates."""
         self._zone_update_callbacks.append(callback)
@@ -97,8 +139,18 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             connection = connection_manager._connections.get(self.monitor_id)
             
             if not connection or not connection.is_connected:
+                # If a 429 put us in a rate-limit backoff window, don't add
+                # another reconnect (which would call the token endpoint again).
+                # Let the library's own retry handle revival once it expires.
+                if time.monotonic() < self._token_backoff_until:
+                    _LOGGER.debug(
+                        "Skipping reconnect for %s during token rate-limit backoff",
+                        self.vessel_name,
+                    )
+                    return {"status": "backoff", "vessel_id": self.vessel_id}
+
                 self._consecutive_failures += 1
-                
+
                 # After 2 consecutive failures (1 minute), try to reconnect with fresh token
                 if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     _LOGGER.warning("Connection lost for %s, attempting reconnect", self.vessel_name)
@@ -160,64 +212,110 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         or are about to expire. It fetches a fresh websocket URL with new JWT tokens
         from the Gecko API using the OAuth2-managed access token.
         """
-        def refresh_token_callback(monitor_id: str | None = None) -> str:
+        def refresh_token_callback(monitor_id: str | None = None) -> str | None:
             """Handle token refresh by getting a new websocket URL.
-            
+
             This is a synchronous callback invoked from background threads by the
             geckoIotClient library. We use run_coroutine_threadsafe to safely
             execute the async API call on Home Assistant's event loop.
-            
+
+            On any failure this returns ``None`` (the contract the library
+            expects): the library then backs off via its own progressive
+            refresh-retry schedule instead of reconnecting with a stale URL.
+            Concurrent calls are serialized (single-flight) and refreshes within
+            MIN_TOKEN_REFRESH_INTERVAL of a success are coalesced; a 429 opens a
+            backoff window (honouring Retry-After) that also suppresses the
+            coordinator's own reconnect path.
+
             Args:
                 monitor_id: The monitor ID that needs token refresh (optional, uses self.monitor_id if not provided)
-                
+
             Returns:
-                New websocket URL with fresh JWT token, or original URL on failure
+                A fresh websocket URL on success, or None on failure.
             """
             # Use provided monitor_id or fall back to coordinator's monitor_id
             target_monitor_id = monitor_id or self.monitor_id
-            
-            try:
-                # Get the config entry
-                entry = self.hass.config_entries.async_get_entry(self.entry_id)
-                if not entry:
-                    _LOGGER.error("Config entry %s not found for vessel %s - cannot refresh token", self.entry_id, self.vessel_name)
-                    return websocket_url
-                
-                # Get API client from runtime data
-                if not hasattr(entry, 'runtime_data') or not entry.runtime_data:
-                    _LOGGER.error("No runtime_data found for vessel %s - cannot refresh token", self.vessel_name)
-                    return websocket_url
-                
-                api_client = entry.runtime_data.api_client
-                if not api_client:
-                    _LOGGER.error("No API client found for vessel %s - cannot refresh token", self.vessel_name)
-                    return websocket_url
-                
-                # Fetch new livestream URL with fresh JWT token
-                # This is a sync callback from background thread, so use run_coroutine_threadsafe
-                future = asyncio.run_coroutine_threadsafe(
-                    api_client.async_get_monitor_livestream(target_monitor_id),
-                    self.hass.loop
-                )
-                
-                # Wait for the API call to complete (with timeout)
-                livestream_data = future.result(timeout=30.0)
-                
-                # Extract the new websocket URL
-                new_url = livestream_data.get("brokerUrl")
-                if new_url:
-                    return new_url
-                else:
-                    _LOGGER.error("No brokerUrl in livestream response for vessel %s", self.vessel_name)
-                    return websocket_url
-                    
-            except TimeoutError:
-                _LOGGER.error("Timeout fetching new websocket URL for vessel %s - API call took too long", self.vessel_name)
-                return websocket_url
-            except Exception as e:
-                _LOGGER.error("Failed to refresh token for vessel %s: %s", self.vessel_name, e, exc_info=True)
-                return websocket_url
-        
+
+            # In a rate-limit backoff window: don't touch the 429'd endpoint.
+            # Returning None lets the library's progressive backoff do the waiting.
+            if time.monotonic() < self._token_backoff_until:
+                return None
+
+            # Single-flight: serialize concurrent refreshes from worker threads.
+            with self._token_refresh_lock:
+                # Coalesce: another thread may have just refreshed successfully.
+                now = time.monotonic()
+                if (
+                    self._cached_ws_url
+                    and (now - self._last_successful_refresh) < MIN_TOKEN_REFRESH_INTERVAL
+                ):
+                    return self._cached_ws_url
+
+                try:
+                    # Get the config entry
+                    entry = self.hass.config_entries.async_get_entry(self.entry_id)
+                    if not entry:
+                        _LOGGER.error("Config entry %s not found for vessel %s - cannot refresh token", self.entry_id, self.vessel_name)
+                        return None
+
+                    # Get API client from runtime data
+                    if not hasattr(entry, 'runtime_data') or not entry.runtime_data:
+                        _LOGGER.error("No runtime_data found for vessel %s - cannot refresh token", self.vessel_name)
+                        return None
+
+                    api_client = entry.runtime_data.api_client
+                    if not api_client:
+                        _LOGGER.error("No API client found for vessel %s - cannot refresh token", self.vessel_name)
+                        return None
+
+                    # Fetch new livestream URL with fresh JWT token
+                    # This is a sync callback from background thread, so use run_coroutine_threadsafe
+                    future = asyncio.run_coroutine_threadsafe(
+                        api_client.async_get_monitor_livestream(target_monitor_id),
+                        self.hass.loop
+                    )
+
+                    # Wait for the API call to complete (with timeout)
+                    livestream_data = future.result(timeout=30.0)
+
+                    # Extract the new websocket URL
+                    new_url = livestream_data.get("brokerUrl")
+                    if new_url:
+                        self._cached_ws_url = new_url
+                        self._last_successful_refresh = time.monotonic()
+                        self._token_backoff_until = 0.0
+                        return new_url
+                    else:
+                        _LOGGER.error("No brokerUrl in livestream response for vessel %s", self.vessel_name)
+                        return None
+
+                except ClientResponseError as e:
+                    if e.status == 429:
+                        retry_after = _parse_retry_after(getattr(e, "headers", None))
+                        if retry_after is None:
+                            retry_after = DEFAULT_RATE_LIMIT_BACKOFF
+                        retry_after = min(retry_after, MAX_RATE_LIMIT_BACKOFF)
+                        self._token_backoff_until = time.monotonic() + retry_after
+                        _LOGGER.warning(
+                            "Gecko token endpoint returned 429 for vessel %s; backing off %.0fs",
+                            self.vessel_name,
+                            retry_after,
+                        )
+                    else:
+                        _LOGGER.error(
+                            "HTTP %s refreshing token for vessel %s: %s",
+                            e.status,
+                            self.vessel_name,
+                            e,
+                        )
+                    return None
+                except TimeoutError:
+                    _LOGGER.error("Timeout fetching new websocket URL for vessel %s - API call took too long", self.vessel_name)
+                    return None
+                except Exception as e:
+                    _LOGGER.error("Failed to refresh token for vessel %s: %s", self.vessel_name, e, exc_info=True)
+                    return None
+
         return refresh_token_callback
 
     async def async_setup_monitor_connection(self, websocket_url: str) -> bool:
