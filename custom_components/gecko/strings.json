@@ -1,24 +1,32 @@
 {
   "config": {
     "step": {
-      "pick_implementation": {
-        "title": "[%key:common::config_flow::title::oauth2_pick_implementation%]"
+      "user": {
+        "title": "Gecko",
+        "description": "Enter your Gecko app email and password.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with Gecko",
+        "description": "Your Gecko credentials are no longer valid. Please re-enter them.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
       }
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]",
-      "already_in_progress": "[%key:common::config_flow::abort::already_in_progress%]",
-      "oauth_error": "[%key:common::config_flow::abort::oauth2_error%]",
-      "oauth_failed": "[%key:common::config_flow::abort::oauth2_failed%]",
-      "oauth_timeout": "[%key:common::config_flow::abort::oauth2_timeout%]",
-      "oauth_unauthorized": "[%key:common::config_flow::abort::oauth2_unauthorized%]",
-      "missing_configuration": "[%key:common::config_flow::abort::oauth2_missing_configuration%]",
-      "authorize_url_timeout": "[%key:common::config_flow::abort::oauth2_authorize_url_timeout%]",
-      "no_url_available": "[%key:common::config_flow::abort::oauth2_no_url_available%]",
-      "user_rejected_authorize": "[%key:common::config_flow::abort::oauth2_user_rejected_authorize%]"
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Failed to connect to Gecko's servers.",
+      "rate_limited": "Too many attempts. Please wait a few minutes and try again.",
+      "auth0_error": "Auth0 login failed.",
+      "unknown": "Unexpected error."
     },
-    "create_entry": {
-      "default": "[%key:common::config_flow::create_entry::authenticated%]"
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]"
     }
   },
   "entity": {
@@ -41,7 +49,7 @@
         "name": "Watercare Mode",
         "state": {
           "away": "Away",
-          "standard": "Standard", 
+          "standard": "Standard",
           "savings": "Savings",
           "super_savings": "Super Savings",
           "weekender": "Weekender",

@@ -3,19 +3,16 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import logging
-import sys
-import os
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client, config_entry_oauth2_flow, config_validation as cv, device_registry as dr
-
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv, device_registry as dr
 
 from .api import OAuthGeckoApi
-from .oauth_implementation import GeckoPKCEOAuth2Implementation
-from .const import DOMAIN, OAUTH2_AUTHORIZE, OAUTH2_CLIENT_ID, OAUTH2_TOKEN
+from .auth0_client import GeckoAuth0InvalidCredentials
+from .const import DOMAIN
 from .coordinator import GeckoVesselCoordinator
 from .connection_manager import async_get_connection_manager
 
@@ -23,19 +20,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
-    """Set up the Gecko component."""
-    # Register hardcoded OAuth implementation with PKCE (no user credentials needed)
-    config_entry_oauth2_flow.async_register_implementation(
-        hass,
-        DOMAIN,
-        GeckoPKCEOAuth2Implementation(
-            hass,
-            DOMAIN,
-            client_id=OAUTH2_CLIENT_ID,
-            authorize_url=OAUTH2_AUTHORIZE,
-            token_url=OAUTH2_TOKEN,
-        ),
-    )
+    """Set up the Gecko component (no global state required)."""
     return True
 
 
@@ -53,16 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Gecko from a config entry."""
-    implementation = (
-        await config_entry_oauth2_flow.async_get_config_entry_implementation(
-            hass, entry
-        )
-    )
-
-    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
-
-    # Create OAuth-based Gecko API client
-    api_client = OAuthGeckoApi(hass, session)
+    api_client = OAuthGeckoApi(hass, entry)
 
     # Create one coordinator per vessel following Home Assistant best practices
     vessels = entry.data.get("vessels", [])
@@ -96,11 +72,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # connection-related issues, not programming errors
     try:
         await _setup_vessels_and_gecko_clients(hass, entry)
+    except GeckoAuth0InvalidCredentials as ex:
+        raise ConfigEntryAuthFailed(f"Gecko credentials rejected: {ex}") from ex
     except (ConnectionError, TimeoutError, OSError) as ex:
-        # These indicate temporary connection issues that should trigger retry
         raise ConfigEntryNotReady(f"Failed to connect to Gecko device: {ex}") from ex
     except KeyError as ex:
-        # Missing required data (e.g., 'refresh_token') indicates auth issues
         raise ConfigEntryNotReady(f"Failed to connect to Gecko device: {ex}") from ex
 
     # Set up platforms immediately - entities will be created when zone data becomes available
@@ -182,7 +158,8 @@ async def _setup_vessel_gecko_client(vessel: dict, api_client: OAuthGeckoApi, co
         
         # Use the singleton connection manager through the coordinator
         success = await coordinator.async_setup_monitor_connection(
-            websocket_url=websocket_url
+            websocket_url=websocket_url,
+            spa_configuration=vessel.get("spa_configuration"),
         )
         
         if not success:

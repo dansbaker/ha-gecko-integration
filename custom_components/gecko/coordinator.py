@@ -318,7 +318,9 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return refresh_token_callback
 
-    async def async_setup_monitor_connection(self, websocket_url: str) -> bool:
+    async def async_setup_monitor_connection(
+        self, websocket_url: str, spa_configuration: dict | None = None
+    ) -> bool:
         """Set up a connection to this vessel's monitor using the singleton connection manager."""
         try:
             # Get the singleton connection manager
@@ -351,6 +353,7 @@ class GeckoVesselCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 vessel_name=self.vessel_name,
                 update_callback=on_zone_update,
                 refresh_token_callback=refresh_token_callback,
+                spa_configuration=spa_configuration,
             )
             
             return True

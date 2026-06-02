@@ -103,6 +103,7 @@ class GeckoConnectionManager:
         vessel_name: str,
         update_callback: Callable[[dict], None] | None = None,
         refresh_token_callback: Callable[[str | None], str] | None = None,
+        spa_configuration: dict | None = None,
     ) -> GeckoMonitorConnection:
         """Get existing connection or create a new one for a monitor."""
         async with self._connection_lock:
@@ -143,9 +144,39 @@ class GeckoConnectionManager:
                 
                 # Set up handlers using the helper method
                 self._setup_client_handlers(gecko_client, connection, monitor_id)
-                
+
+                # Gecko's new MQTT custom authorizer (June 2026) no longer
+                # grants the `$aws/things/{id}/config/get` topic the library
+                # uses for `load_configuration`. The config lives in the HTTP
+                # /spa-configuration response we cached at config-flow time —
+                # patch the transporter to wait for MQTT subscriptions to be
+                # ready (the original behavior) and then invoke the config
+                # callback directly with our cached config, which causes the
+                # library to parse zones and trigger `load_state()` (whose
+                # `shadow/name/state/get` topic IS still granted).
+                if spa_configuration is not None:
+                    import time as _time
+                    from gecko_iot_client.transporters.exceptions import (
+                        ConfigurationError as _ConfigurationError,
+                    )
+
+                    def _patched_load_configuration(timeout: float = 30.0) -> None:
+                        wait_start = _time.time()
+                        while (
+                            not transporter._subscriptions_setup
+                            and (_time.time() - wait_start) < timeout
+                        ):
+                            _time.sleep(0.1)
+                        if not transporter._subscriptions_setup:
+                            raise _ConfigurationError("Subscriptions not ready within timeout")
+                        for cb in transporter._callback_registry.get_callbacks("config"):
+                            cb(spa_configuration)
+
+                    transporter.load_configuration = _patched_load_configuration
+
                 # Connect using executor since connect() is synchronous
                 await self.hass.async_add_executor_job(gecko_client.connect)
+
                 connection.is_connected = True
                 
                 # Store the connection
