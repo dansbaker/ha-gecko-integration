@@ -86,12 +86,11 @@ class GeckoConnectionManager:
             # Store connectivity status in connection for easy access
             connection.connectivity_status = connectivity_status
             
-            # Update connection status based on connectivity
-            if hasattr(connectivity_status, 'vessel_status'):
-                # If vessel is running but transporter is not connected, we may need to refresh token
-                vessel_running = str(connectivity_status.vessel_status) == 'RUNNING'
-                if vessel_running and not connection.is_connected:
-                    _LOGGER.warning("Vessel running but connection not established for %s", monitor_id)
+            # Update connection.is_connected to reflect actual transport state
+            # This ensures the coordinator detects disconnections and can trigger reconnection
+            connection.is_connected = bool(
+                getattr(connectivity_status, "transport_connected", False)
+            )
         
         gecko_client.on_zone_update(on_zone_update)
         gecko_client.on(EventChannel.CONNECTIVITY_UPDATE, on_connectivity_update)
@@ -103,7 +102,6 @@ class GeckoConnectionManager:
         vessel_name: str,
         update_callback: Callable[[dict], None] | None = None,
         refresh_token_callback: Callable[[str | None], str] | None = None,
-        spa_configuration: dict | None = None,
     ) -> GeckoMonitorConnection:
         """Get existing connection or create a new one for a monitor."""
         async with self._connection_lock:
@@ -144,39 +142,9 @@ class GeckoConnectionManager:
                 
                 # Set up handlers using the helper method
                 self._setup_client_handlers(gecko_client, connection, monitor_id)
-
-                # Gecko's new MQTT custom authorizer (June 2026) no longer
-                # grants the `$aws/things/{id}/config/get` topic the library
-                # uses for `load_configuration`. The config lives in the HTTP
-                # /spa-configuration response we cached at config-flow time —
-                # patch the transporter to wait for MQTT subscriptions to be
-                # ready (the original behavior) and then invoke the config
-                # callback directly with our cached config, which causes the
-                # library to parse zones and trigger `load_state()` (whose
-                # `shadow/name/state/get` topic IS still granted).
-                if spa_configuration is not None:
-                    import time as _time
-                    from gecko_iot_client.transporters.exceptions import (
-                        ConfigurationError as _ConfigurationError,
-                    )
-
-                    def _patched_load_configuration(timeout: float = 30.0) -> None:
-                        wait_start = _time.time()
-                        while (
-                            not transporter._subscriptions_setup
-                            and (_time.time() - wait_start) < timeout
-                        ):
-                            _time.sleep(0.1)
-                        if not transporter._subscriptions_setup:
-                            raise _ConfigurationError("Subscriptions not ready within timeout")
-                        for cb in transporter._callback_registry.get_callbacks("config"):
-                            cb(spa_configuration)
-
-                    transporter.load_configuration = _patched_load_configuration
-
+                
                 # Connect using executor since connect() is synchronous
                 await self.hass.async_add_executor_job(gecko_client.connect)
-
                 connection.is_connected = True
                 
                 # Store the connection
@@ -240,8 +208,8 @@ class GeckoConnectionManager:
         try:
             # Get the token refresh callback from the existing connection
             refresh_callback = None
-            if hasattr(connection.gecko_client, 'transporter') and hasattr(connection.gecko_client.transporter, '_token_refresh_callback'):
-                refresh_callback = connection.gecko_client.transporter._token_refresh_callback
+            if connection.gecko_client and connection.gecko_client.transporter:
+                refresh_callback = getattr(connection.gecko_client.transporter, '_token_refresh_callback', None)
             
             if not refresh_callback or not callable(refresh_callback):
                 _LOGGER.error("No token refresh callback available for monitor %s - cannot reconnect", monitor_id)
@@ -276,24 +244,8 @@ class GeckoConnectionManager:
                 
                 gecko_client = GeckoIotClient(monitor_id, transporter, config_timeout=CONFIG_TIMEOUT)
                 
-                # Set up zone update handler to distribute to all callbacks
-                def on_zone_update(updated_zones):
-                    for callback in connection.update_callbacks:
-                        try:
-                            callback(updated_zones)
-                        except Exception as e:
-                            _LOGGER.error("Error in zone update callback for monitor %s: %s", monitor_id, e)
-                
-                # Set up connectivity update handler
-                def on_connectivity_update(connectivity_status):
-                    connection.connectivity_status = connectivity_status
-                    if hasattr(connectivity_status, 'vessel_status'):
-                        vessel_running = str(connectivity_status.vessel_status) == 'RUNNING'
-                        if vessel_running and not connection.is_connected:
-                            _LOGGER.warning("Vessel running but connection not established for %s", monitor_id)
-                
-                gecko_client.on_zone_update(on_zone_update)
-                gecko_client.on(EventChannel.CONNECTIVITY_UPDATE, on_connectivity_update)
+                # Set up handlers using the helper method (DRY principle)
+                self._setup_client_handlers(gecko_client, connection, monitor_id)
                 
                 # Update connection object with new client and URL
                 connection.gecko_client = gecko_client
@@ -421,7 +373,7 @@ class GeckoConnectionManager:
                 "websocket_url": connection.websocket_url,
             }
             
-            if hasattr(connection.gecko_client, 'connectivity_status') and connection.gecko_client.connectivity_status:
+            if connection.gecko_client and connection.gecko_client.connectivity_status:
                 status_info["connectivity_status"] = str(connection.gecko_client.connectivity_status)
             
             return status_info
