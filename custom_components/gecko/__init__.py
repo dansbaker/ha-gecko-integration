@@ -8,11 +8,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv, device_registry as dr
+from homeassistant.helpers import config_entry_oauth2_flow, config_validation as cv, device_registry as dr, entity_registry as er
+
 
 from .api import OAuthGeckoApi
-from .auth0_client import GeckoAuth0InvalidCredentials
-from .const import DOMAIN
+from .oauth_implementation import GeckoPKCEOAuth2Implementation
+from .const import DOMAIN, OAUTH2_AUTHORIZE, OAUTH2_CLIENT_ID, OAUTH2_TOKEN
 from .coordinator import GeckoVesselCoordinator
 from .connection_manager import async_get_connection_manager
 
@@ -20,7 +21,19 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
-    """Set up the Gecko component (no global state required)."""
+    """Set up the Gecko component."""
+    # Register hardcoded OAuth implementation with PKCE (no user credentials needed)
+    config_entry_oauth2_flow.async_register_implementation(
+        hass,
+        DOMAIN,
+        GeckoPKCEOAuth2Implementation(
+            hass,
+            DOMAIN,
+            client_id=OAUTH2_CLIENT_ID,
+            authorize_url=OAUTH2_AUTHORIZE,
+            token_url=OAUTH2_TOKEN,
+        ),
+    )
     return True
 
 
@@ -31,14 +44,86 @@ class GeckoRuntimeData:
     coordinators: list[GeckoVesselCoordinator]
 
 
+type GeckoConfigEntry = ConfigEntry[GeckoRuntimeData]
+
+
 # List the platforms that this integration supports.
 _PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.FAN, Platform.CLIMATE, Platform.SELECT, Platform.BINARY_SENSOR]  
 _LOGGER = logging.getLogger(__name__)
 
 
+def _migrate_entity_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate entity unique_ids from old vessel_name format to stable vessel_id format.
+
+    Old format: {entry_id}_{vessel_name}_light_{zone_id}
+    New format: {entry_id}_{vessel_id}_light_{zone_id}
+
+    This prevents duplicate entities when unique_id format changes.
+    """
+    entity_reg = er.async_get(hass)
+    vessels = entry.data.get("vessels", [])
+
+    for vessel in vessels:
+        vessel_id = vessel.get("vesselId")
+        vessel_name = vessel.get("name")
+        if not vessel_id or not vessel_name:
+            continue
+
+        # Build mapping of old unique_id prefix → new unique_id prefix
+        old_prefix = f"{entry.entry_id}_{vessel_name}"
+        new_prefix = f"{entry.entry_id}_{vessel_id}"
+
+        if old_prefix == new_prefix:
+            continue
+
+        # Find all entities belonging to this config entry with the old prefix
+        entries = er.async_entries_for_config_entry(entity_reg, entry.entry_id)
+        for entity_entry in entries:
+            if entity_entry.unique_id.startswith(old_prefix):
+                new_unique_id = entity_entry.unique_id.replace(
+                    old_prefix, new_prefix, 1
+                )
+                # Only migrate if target unique_id isn't already taken
+                if not entity_reg.async_get_entity_id(
+                    entity_entry.domain, DOMAIN, new_unique_id
+                ):
+                    entity_reg.async_update_entity(
+                        entity_entry.entity_id, new_unique_id=new_unique_id
+                    )
+                    _LOGGER.debug(
+                        "Migrated entity %s unique_id: %s → %s",
+                        entity_entry.entity_id,
+                        entity_entry.unique_id,
+                        new_unique_id,
+                    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Gecko from a config entry."""
-    api_client = OAuthGeckoApi(hass, entry)
+    # Migrate entity unique_ids from old format (vessel_name) to new format (vessel_id)
+    _migrate_entity_unique_ids(hass, entry)
+
+    # Entries created by the dansbaker fork's v2.1.0 headless flow have been
+    # downgraded to version 1 by ``async_migrate_entry``, but they still lack
+    # ``auth_implementation`` / ``token`` because they were never created by
+    # the standard OAuth flow. Trip ``ConfigEntryAuthFailed`` so HA renders
+    # the reauth UI instead of crashing with a KeyError downstream.
+    if "auth_implementation" not in entry.data or "token" not in entry.data:
+        raise ConfigEntryAuthFailed(
+            "Re-authentication required after upgrade from a community-fork "
+            "release. Click 'Reconfigure' on the Gecko integration card."
+        )
+
+    implementation = (
+        await config_entry_oauth2_flow.async_get_config_entry_implementation(
+            hass, entry
+        )
+    )
+
+    session = config_entry_oauth2_flow.OAuth2Session(hass, entry, implementation)
+
+    # Create OAuth-based Gecko API client
+    api_client = OAuthGeckoApi(hass, session)
 
     # Create one coordinator per vessel following Home Assistant best practices
     vessels = entry.data.get("vessels", [])
@@ -72,11 +157,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # connection-related issues, not programming errors
     try:
         await _setup_vessels_and_gecko_clients(hass, entry)
-    except GeckoAuth0InvalidCredentials as ex:
-        raise ConfigEntryAuthFailed(f"Gecko credentials rejected: {ex}") from ex
-    except (ConnectionError, TimeoutError, OSError) as ex:
-        raise ConfigEntryNotReady(f"Failed to connect to Gecko device: {ex}") from ex
-    except KeyError as ex:
+    except ConfigEntryAuthFailed:
+        # Re-raise auth failures directly so HA triggers the reauth flow
+        raise
+    except OSError as ex:
+        # OSError covers ConnectionError, TimeoutError, and other I/O issues
         raise ConfigEntryNotReady(f"Failed to connect to Gecko device: {ex}") from ex
 
     # Set up platforms immediately - entities will be created when zone data becomes available
@@ -137,6 +222,8 @@ def _setup_vessel_device(entry: ConfigEntry, vessel: dict, device_registry: dr.D
 
 async def _setup_vessel_gecko_client(vessel: dict, api_client: OAuthGeckoApi, coordinator: GeckoVesselCoordinator) -> None:
     """Set up geckoIotClient connection for a vessel using the singleton connection manager."""
+    from aiohttp import ClientResponseError
+
     vessel_id = vessel.get("vesselId")
     vessel_name = vessel.get("name", f"Vessel {vessel_id}")
     monitor_id = vessel.get("monitorId")
@@ -158,13 +245,19 @@ async def _setup_vessel_gecko_client(vessel: dict, api_client: OAuthGeckoApi, co
         
         # Use the singleton connection manager through the coordinator
         success = await coordinator.async_setup_monitor_connection(
-            websocket_url=websocket_url,
-            spa_configuration=vessel.get("spa_configuration"),
+            websocket_url=websocket_url
         )
         
         if not success:
             raise ConnectionError(f"Failed to setup connection for monitor {monitor_id}")
-            
+
+    except ClientResponseError as ex:
+        if ex.status in (401, 403):
+            raise ConfigEntryAuthFailed(
+                f"Authentication failed for vessel {vessel_name}: {ex}"
+            ) from ex
+        _LOGGER.error("Failed to set up connection for monitor %s: %s", monitor_id, ex, exc_info=True)
+        raise
     except Exception as ex:
         _LOGGER.error("Failed to set up connection for monitor %s: %s", monitor_id, ex, exc_info=True)
         raise
@@ -190,3 +283,63 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("Error disconnecting monitors during unload: %s", ex)
     
     return await hass.config_entries.async_unload_platforms(entry, _PLATFORMS)
+
+
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Migrate old entry data to current schema version.
+
+    Schema history:
+
+    * **Version 1** (current, matches upstream): standard HA OAuth2 entry with
+      tokens stored under ``data['token']`` (singular).
+    * **Version 2** (dansbaker fork v2.1.0 only): headless-Auth0 entry created
+      by the now-removed email/password config flow. Tokens were stored under
+      ``data['tokens']`` (plural) along with ``data['username']`` and
+      ``data['user_id']``. These tokens were minted against the mobile app's
+      Auth0 client; the standard OAuth2 flow uses a different client, so the
+      stored refresh token isn't reusable. The cleanest path is to clear the
+      auth state and let HA's reauth flow take the user through a normal
+      OAuth login.
+    """
+    _LOGGER.debug(
+        "Migrating config entry from version %s.%s",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+
+    if config_entry.version == 2:
+        # Coming from dansbaker fork v2.1.0. Strip the incompatible auth
+        # fields; keep vessels / account_id / account_info so the integration
+        # can still describe the device while reauth proceeds. Downgrade
+        # ``version`` back to 1 so the rest of the codebase treats it as a
+        # standard OAuth2 entry.
+        sanitized = {
+            k: v
+            for k, v in config_entry.data.items()
+            if k not in {"tokens", "username", "user_id"}
+        }
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data=sanitized,
+            version=1,
+            minor_version=1,
+        )
+        _LOGGER.info(
+            "Cleared headless-flow tokens from entry %s; user will be prompted "
+            "to re-authenticate via the standard OAuth flow",
+            config_entry.title,
+        )
+        return True
+
+    if config_entry.version > 2:
+        # Downgrade from a future version is not supported
+        return False
+
+    if config_entry.version < 1:
+        # Migrate from pre-1.0 to version 1
+        hass.config_entries.async_update_entry(
+            config_entry, version=1, minor_version=1
+        )
+
+    # Version 1 is the current version — no further migration needed
+    return True

@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 from homeassistant.components.fan import FanEntity, FanEntityFeature
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
@@ -15,6 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import GeckoVesselCoordinator
 from .entity import GeckoEntityAvailabilityMixin
+from . import GeckoConfigEntry
 
 from gecko_iot_client.models.zone_types import ZoneType, FlowZoneType
 from gecko_iot_client.models.flow_zone import FlowZone, FlowZoneCapabilities
@@ -23,7 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
+    config_entry: GeckoConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Gecko fan entities from a config entry."""
@@ -55,12 +55,14 @@ async def async_setup_entry(
 
 class GeckoFan(GeckoEntityAvailabilityMixin, CoordinatorEntity, FanEntity):
     """Representation of a Gecko pump fan (multi-speed or variable speed)."""
+
+    _attr_has_entity_name = True
     coordinator: GeckoVesselCoordinator
     
     def __init__(
         self,
         coordinator: GeckoVesselCoordinator,
-        config_entry: ConfigEntry,
+        config_entry: GeckoConfigEntry,
         zone: FlowZone,  # FlowZone from coordinator
     ) -> None:
         """Initialize the Pump Fan."""
@@ -68,9 +70,10 @@ class GeckoFan(GeckoEntityAvailabilityMixin, CoordinatorEntity, FanEntity):
         CoordinatorEntity.__init__(self, coordinator)
         self._coordinator: GeckoVesselCoordinator = coordinator
         self._zone = zone
-        self.entity_id = f"fan.{coordinator.vessel_name}_pump_{zone.id}".lower()
-        self._attr_name = f"{coordinator.vessel_name} {zone.name}"
-        self._attr_unique_id = f"{config_entry.entry_id}_{coordinator.vessel_name}_pump_{zone.id}"
+        self._attr_name = zone.name
+        self._attr_unique_id = (
+            f"{config_entry.entry_id}_{coordinator.vessel_id}_pump_{zone.id}"
+        )
 
         self._attr_device_info = dr.DeviceInfo(
             identifiers={(DOMAIN, str(coordinator.vessel_id))},
